@@ -1,11 +1,9 @@
-mod benchmarks;
-
 use anyhow::{bail, Context, Result};
-use benchmarks::Benchmarks;
 use log::{error, info};
 use md5::{Digest, Md5};
 use rand::{thread_rng, RngCore};
 use std::{
+    convert::TryInto,
     env::args,
     mem::size_of,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
@@ -14,11 +12,12 @@ use std::{
         Arc, Mutex,
     },
     thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const PACKET_SIZE: usize = 1200;
 const CHECKSUM_SIZE: usize = 16;
-const KEY_SIZE: usize = size_of::<u64>();
+const KEY_SIZE: usize = size_of::<u128>();
 
 fn main() {
     env_logger::init();
@@ -32,7 +31,6 @@ fn main() {
         concurrency_s.parse().expect("CONCURRENCY MUST BE NUMBER")
     };
     let socket_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port));
-    let benchmarks = Benchmarks::new();
 
     let clients_stats = Arc::new(Mutex::new(Stats::default()));
     let clients_alive = Arc::new(AtomicUsize::new(concurrency));
@@ -40,17 +38,15 @@ fn main() {
     info!("Core ids: {}", core_ids.len());
     let server_thread = {
         let clients_alive = clients_alive.to_owned();
-        let benchmarks = benchmarks.to_owned();
         let core_id = core_ids.pop().expect("Empty cores");
         thread::spawn(move || {
             core_affinity::set_for_current(core_id);
-            echo_server(socket_addr, clients_alive, benchmarks)
+            echo_server(socket_addr, clients_alive)
         })
     };
     let mut client_threads = Vec::with_capacity(concurrency);
     for i in 0..concurrency {
         let clients_stats = clients_stats.to_owned();
-        let benchmarks = benchmarks.to_owned();
         let core_id = core_ids
             .iter()
             .nth(i % core_ids.len())
@@ -58,7 +54,7 @@ fn main() {
             .to_owned();
         client_threads.push(thread::spawn(move || {
             core_affinity::set_for_current(core_id);
-            echo_client(socket_addr, clients_stats, benchmarks)
+            echo_client(socket_addr, clients_stats)
         }));
     }
     for thread in client_threads {
@@ -72,14 +68,14 @@ fn main() {
     }
 }
 
-fn echo_server(socket_addr: SocketAddr, clients_alive: Arc<AtomicUsize>, benchmarks: Benchmarks) {
+fn echo_server(socket_addr: SocketAddr, clients_alive: Arc<AtomicUsize>) {
     let mut socket = UdpSocket::bind(socket_addr).expect("Bind udp socket error");
     let mut total = 0;
     let mut succeed = 0;
 
     while clients_alive.load(Ordering::SeqCst) > 0 {
         total += 1;
-        if let Err(err) = _echo_server(&mut socket, &benchmarks) {
+        if let Err(err) = _echo_server(&mut socket) {
             error!("Echo error: {} ({} / {})", err, succeed, total);
         } else {
             succeed += 1;
@@ -87,7 +83,7 @@ fn echo_server(socket_addr: SocketAddr, clients_alive: Arc<AtomicUsize>, benchma
         }
     }
 
-    fn _echo_server(socket: &mut UdpSocket, benchmarks: &Benchmarks) -> Result<()> {
+    fn _echo_server(socket: &mut UdpSocket) -> Result<()> {
         let mut buf = [0u8; PACKET_SIZE];
         let (received, src) = socket
             .recv_from(&mut buf)
@@ -101,9 +97,17 @@ fn echo_server(socket_addr: SocketAddr, clients_alive: Arc<AtomicUsize>, benchma
             let key_part =
                 &mut buf[(received - CHECKSUM_SIZE - KEY_SIZE)..(received - CHECKSUM_SIZE)];
             key_buf.copy_from_slice(key_part);
-            if let Some(duration) = benchmarks.done(u64::from_le_bytes(key_buf)) {
-                info!("*** Server benchmarks: {} ms", duration.as_millis());
-            }
+            let duration = SystemTime::now()
+                .duration_since(
+                    UNIX_EPOCH
+                        + Duration::from_millis(
+                            u128::from_le_bytes(key_buf)
+                                .try_into()
+                                .expect("Cannot convert millis to u64"),
+                        ),
+                )
+                .expect("Wrong time system");
+            info!("*** Server benchmarks: {} ms", duration.as_millis());
         }
 
         {
@@ -121,7 +125,13 @@ fn echo_server(socket_addr: SocketAddr, clients_alive: Arc<AtomicUsize>, benchma
         {
             let key_part =
                 &mut buf[(received - CHECKSUM_SIZE - KEY_SIZE)..(received - CHECKSUM_SIZE)];
-            key_part.copy_from_slice(&benchmarks.new_key().to_le_bytes());
+            key_part.copy_from_slice(
+                &SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("Never before 1970")
+                    .as_millis()
+                    .to_le_bytes(),
+            );
         }
 
         socket
@@ -137,22 +147,18 @@ struct Stats {
     succeed: u64,
 }
 
-fn echo_client(server_addr: SocketAddr, stats: Arc<Mutex<Stats>>, benchmarks: Benchmarks) {
-    if let Err(err) = thread_worker(server_addr, stats, benchmarks) {
+fn echo_client(server_addr: SocketAddr, stats: Arc<Mutex<Stats>>) {
+    if let Err(err) = thread_worker(server_addr, stats) {
         error!("Start thread worker error: {}", err);
     }
 
-    fn thread_worker(
-        server_addr: SocketAddr,
-        stats: Arc<Mutex<Stats>>,
-        benchmarks: Benchmarks,
-    ) -> Result<()> {
+    fn thread_worker(server_addr: SocketAddr, stats: Arc<Mutex<Stats>>) -> Result<()> {
         let mut udp_socket = UdpSocket::bind((IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0))?;
         udp_socket.connect(server_addr)?;
 
         loop {
             stats.lock().unwrap().total += 1;
-            if let Err(err) = _echo_client(&mut udp_socket, &benchmarks) {
+            if let Err(err) = _echo_client(&mut udp_socket) {
                 let stats = stats.lock().unwrap();
                 error!("Echo error: {} ({} / {})", err, stats.succeed, stats.total);
             } else {
@@ -163,7 +169,7 @@ fn echo_client(server_addr: SocketAddr, stats: Arc<Mutex<Stats>>, benchmarks: Be
         }
     }
 
-    fn _echo_client(udp_socket: &mut UdpSocket, benchmarks: &Benchmarks) -> anyhow::Result<()> {
+    fn _echo_client(udp_socket: &mut UdpSocket) -> anyhow::Result<()> {
         let mut rng = thread_rng();
 
         let mut send_buf = [0u8; PACKET_SIZE];
@@ -177,7 +183,13 @@ fn echo_client(server_addr: SocketAddr, stats: Arc<Mutex<Stats>>, benchmarks: Be
         {
             let key_buf = &mut send_buf
                 [(PACKET_SIZE - CHECKSUM_SIZE - KEY_SIZE)..(PACKET_SIZE - CHECKSUM_SIZE)];
-            key_buf.copy_from_slice(&benchmarks.new_key().to_le_bytes());
+            key_buf.copy_from_slice(
+                &SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("Never before 1970")
+                    .as_millis()
+                    .to_le_bytes(),
+            );
         }
 
         {
@@ -199,9 +211,17 @@ fn echo_client(server_addr: SocketAddr, stats: Arc<Mutex<Stats>>, benchmarks: Be
             key_buf.copy_from_slice(
                 &recv_buf[(received - CHECKSUM_SIZE - KEY_SIZE)..(received - CHECKSUM_SIZE)],
             );
-            if let Some(duration) = benchmarks.done(u64::from_le_bytes(key_buf)) {
-                info!("*** Client benchmarks: {} ms", duration.as_millis());
-            }
+            let duration = SystemTime::now()
+                .duration_since(
+                    UNIX_EPOCH
+                        + Duration::from_millis(
+                            u128::from_le_bytes(key_buf)
+                                .try_into()
+                                .expect("Cannot convert millis to u64"),
+                        ),
+                )
+                .expect("Wrong time system");
+            info!("*** Client benchmarks: {} ms", duration.as_millis());
         }
 
         if recv_buf[..(received - CHECKSUM_SIZE - KEY_SIZE)]
