@@ -10,7 +10,7 @@ use std::{
     mem::size_of,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -32,27 +32,33 @@ fn main() {
         concurrency_s.parse().expect("CONCURRENCY MUST BE NUMBER")
     };
     let socket_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port));
-
     let benchmarks = Benchmarks::new();
-
-    let client_interrupted = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&client_interrupted))
-        .expect("FAILED TO SETUP SIGNAL HANDLER");
 
     let clients_stats = Arc::new(Mutex::new(Stats::default()));
     let clients_alive = Arc::new(AtomicUsize::new(concurrency));
+    let mut core_ids = core_affinity::get_core_ids().expect("Get core ids error");
+    info!("Core ids: {}", core_ids.len());
     let server_thread = {
         let clients_alive = clients_alive.to_owned();
         let benchmarks = benchmarks.to_owned();
-        thread::spawn(move || echo_server(socket_addr, clients_alive, benchmarks))
+        let core_id = core_ids.pop().expect("Empty cores");
+        thread::spawn(move || {
+            core_affinity::set_for_current(core_id);
+            echo_server(socket_addr, clients_alive, benchmarks)
+        })
     };
     let mut client_threads = Vec::with_capacity(concurrency);
-    for _ in 0..concurrency {
+    for i in 0..concurrency {
         let clients_stats = clients_stats.to_owned();
-        let client_interrupted = client_interrupted.to_owned();
         let benchmarks = benchmarks.to_owned();
+        let core_id = core_ids
+            .iter()
+            .nth(i % core_ids.len())
+            .expect("Need more core")
+            .to_owned();
         client_threads.push(thread::spawn(move || {
-            echo_client(socket_addr, clients_stats, client_interrupted, benchmarks)
+            core_affinity::set_for_current(core_id);
+            echo_client(socket_addr, clients_stats, benchmarks)
         }));
     }
     for thread in client_threads {
@@ -131,26 +137,20 @@ struct Stats {
     succeed: u64,
 }
 
-fn echo_client(
-    server_addr: SocketAddr,
-    stats: Arc<Mutex<Stats>>,
-    interrupted: Arc<AtomicBool>,
-    benchmarks: Benchmarks,
-) {
-    if let Err(err) = thread_worker(server_addr, stats, interrupted, benchmarks) {
+fn echo_client(server_addr: SocketAddr, stats: Arc<Mutex<Stats>>, benchmarks: Benchmarks) {
+    if let Err(err) = thread_worker(server_addr, stats, benchmarks) {
         error!("Start thread worker error: {}", err);
     }
 
     fn thread_worker(
         server_addr: SocketAddr,
         stats: Arc<Mutex<Stats>>,
-        interrupted: Arc<AtomicBool>,
         benchmarks: Benchmarks,
     ) -> Result<()> {
         let mut udp_socket = UdpSocket::bind((IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0))?;
         udp_socket.connect(server_addr)?;
 
-        while !interrupted.load(Ordering::SeqCst) {
+        loop {
             stats.lock().unwrap().total += 1;
             if let Err(err) = _echo_client(&mut udp_socket, &benchmarks) {
                 let stats = stats.lock().unwrap();
@@ -161,8 +161,6 @@ fn echo_client(
                 info!("Echo ok: ({} / {})", stats.succeed, stats.total);
             }
         }
-
-        Ok(())
     }
 
     fn _echo_client(udp_socket: &mut UdpSocket, benchmarks: &Benchmarks) -> anyhow::Result<()> {
