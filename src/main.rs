@@ -1,12 +1,18 @@
 use anyhow::{bail, Context, Result};
+use core::slice;
 use log::{error, info};
 use md5::{Digest, Md5};
+use nix::sys::{
+    socket::{recvmmsg, InetAddr, MsgFlags, RecvMmsgData, SockAddr},
+    uio::IoVec,
+};
 use rand::{thread_rng, RngCore};
 use std::{
     convert::TryInto,
     env::args,
-    mem::size_of,
+    mem::{size_of, zeroed},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
+    os::unix::prelude::AsRawFd,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -76,67 +82,98 @@ fn echo_server(socket_addr: SocketAddr, clients_alive: Arc<AtomicUsize>) {
     while clients_alive.load(Ordering::SeqCst) > 0 {
         total += 1;
         if let Err(err) = _echo_server(&mut socket) {
-            error!("Echo error: {} ({} / {})", err, succeed, total);
+            error!("Server echo error: {} ({} / {})", err, succeed, total);
         } else {
             succeed += 1;
-            info!("Echo ok: ({} / {})", succeed, total);
+            info!("Server echo ok: ({} / {})", succeed, total);
         }
     }
 
     fn _echo_server(socket: &mut UdpSocket) -> Result<()> {
-        let mut buf = [0u8; PACKET_SIZE];
-        let (received, src) = socket
-            .recv_from(&mut buf)
-            .with_context(|| "Receive error")?;
-        if received < CHECKSUM_SIZE + KEY_SIZE {
-            bail!("Short received: {}", received);
-        }
-
-        {
-            let mut key_buf = [0u8; KEY_SIZE];
-            let key_part =
-                &mut buf[(received - CHECKSUM_SIZE - KEY_SIZE)..(received - CHECKSUM_SIZE)];
-            key_buf.copy_from_slice(key_part);
-            let duration = SystemTime::now()
-                .duration_since(
-                    UNIX_EPOCH
-                        + Duration::from_millis(
-                            u128::from_le_bytes(key_buf)
-                                .try_into()
-                                .expect("Cannot convert millis to u64"),
-                        ),
-                )
-                .expect("Wrong time system");
-            info!("*** Server benchmarks: {} ms", duration.as_millis());
-        }
-
-        {
-            let checksum = &buf[(received - CHECKSUM_SIZE)..received];
-            let expected = {
-                let mut hasher = Md5::new();
-                hasher.update(&buf[..(received - CHECKSUM_SIZE)]);
-                hasher.finalize()
-            };
-            if checksum != expected.as_slice() {
-                bail!("Invalid checksum");
+        // let (received, src) = socket
+        //     .recv_from(&mut buf)
+        //     .with_context(|| "Receive error")?;
+        const MSGLEN: usize = 16;
+        let mut bufs = [[0u8; PACKET_SIZE]; MSGLEN];
+        let mut iovecs: [[IoVec<&mut [u8]>; 1]; MSGLEN] = unsafe { zeroed() };
+        bufs.iter_mut()
+            .map(|buf| unsafe { slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.len()) })
+            .enumerate()
+            .for_each(|(idx, buf)| iovecs[idx] = [IoVec::from_mut_slice(buf)]);
+        let mut msgs: [RecvMmsgData<&[IoVec<&mut [u8]>]>; MSGLEN] = unsafe { zeroed() };
+        iovecs.iter().enumerate().for_each(|(idx, iovec)| {
+            msgs[idx] = RecvMmsgData {
+                iov: iovec,
+                cmsg_buffer: None,
             }
-        }
+        });
+        let received_messages = recvmmsg(
+            socket.as_raw_fd(),
+            msgs.iter_mut(),
+            MsgFlags::empty(),
+            Some(Duration::from_millis(0).into()),
+        )?;
 
-        {
-            let key_part =
-                &mut buf[(received - CHECKSUM_SIZE - KEY_SIZE)..(received - CHECKSUM_SIZE)];
-            key_part.copy_from_slice(
-                &SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("Never before 1970")
-                    .as_millis()
-                    .to_le_bytes(),
-            );
-        }
+        info!("*** received_messages: {}", received_messages.len());
+        for (idx, received_message) in received_messages.into_iter().enumerate() {
+            let src = match received_message.address {
+                Some(SockAddr::Inet(inet_addr)) => inet_addr.to_std(),
+                _ => panic!("Invalid address: {:?}", received_message.address),
+            };
+            let received = received_message.bytes;
+            let buf: &mut [u8] =
+                unsafe { slice::from_raw_parts_mut(bufs[idx].as_mut_ptr(), bufs[idx].len()) };
 
-        socket
-            .send_to(&buf[..received], src)
-            .with_context(|| "Send error")?;
+            if received < CHECKSUM_SIZE + KEY_SIZE {
+                bail!("Short received: {}", received);
+            }
+
+            {
+                let mut key_buf = [0u8; KEY_SIZE];
+                let key_part =
+                    &mut buf[(received - CHECKSUM_SIZE - KEY_SIZE)..(received - CHECKSUM_SIZE)];
+                key_buf.copy_from_slice(key_part);
+                let duration = SystemTime::now()
+                    .duration_since(
+                        UNIX_EPOCH
+                            + Duration::from_millis(
+                                u128::from_le_bytes(key_buf)
+                                    .try_into()
+                                    .expect("Cannot convert millis to u64"),
+                            ),
+                    )
+                    .expect("Wrong time system");
+                info!("*** Server benchmarks: {} ms", duration.as_millis());
+            }
+
+            {
+                let checksum = &buf[(received - CHECKSUM_SIZE)..received];
+                let expected = {
+                    let mut hasher = Md5::new();
+                    hasher.update(&buf[..(received - CHECKSUM_SIZE)]);
+                    hasher.finalize()
+                };
+                if checksum != expected.as_slice() {
+                    bail!("Invalid checksum");
+                }
+            }
+
+            {
+                let key_part =
+                    &mut buf[(received - CHECKSUM_SIZE - KEY_SIZE)..(received - CHECKSUM_SIZE)];
+                key_part.copy_from_slice(
+                    &SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("Never before 1970")
+                        .as_millis()
+                        .to_le_bytes(),
+                );
+            }
+
+            socket
+                .send_to(&buf[..received], src)
+                .with_context(|| "Send error")?;
+        }
         Ok(())
     }
 }
@@ -160,11 +197,14 @@ fn echo_client(server_addr: SocketAddr, stats: Arc<Mutex<Stats>>) {
             stats.lock().unwrap().total += 1;
             if let Err(err) = _echo_client(&mut udp_socket) {
                 let stats = stats.lock().unwrap();
-                error!("Echo error: {} ({} / {})", err, stats.succeed, stats.total);
+                error!(
+                    "Client echo error: {} ({} / {})",
+                    err, stats.succeed, stats.total
+                );
             } else {
                 let mut stats = stats.lock().unwrap();
                 stats.succeed += 1;
-                info!("Echo ok: ({} / {})", stats.succeed, stats.total);
+                info!("Client echo ok: ({} / {})", stats.succeed, stats.total);
             }
         }
     }
